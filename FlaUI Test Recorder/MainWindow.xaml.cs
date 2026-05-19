@@ -20,6 +20,7 @@ namespace FlaUI_Test_Recorder
         private const int WmMouseWheel = 0x020A;
         private const int WmKeyDown = 0x0100;
         private const int WmSysKeyDown = 0x0104;
+        private const int VkControl = 0x11;
         private const int ElementWaitTimeoutSeconds = 10;
         private const int WaitPollMilliseconds = 200;
 
@@ -256,7 +257,8 @@ namespace FlaUI_Test_Recorder
                 if (message is WmLButtonDown or WmRButtonDown or WmMButtonDown or WmMouseWheel)
                 {
                     var hookData = Marshal.PtrToStructure<MsLlHookStruct>(lParam);
-                    RecordMouseEvent(message, hookData.Point.X, hookData.Point.Y, hookData.MouseData);
+                    var isCtrlPressed = IsControlPressed();
+                    RecordMouseEvent(message, hookData.Point.X, hookData.Point.Y, hookData.MouseData, isCtrlPressed);
                 }
             }
 
@@ -296,7 +298,7 @@ namespace FlaUI_Test_Recorder
             return processId == (uint)_targetProcess.Id;
         }
 
-        private void RecordMouseEvent(int message, int x, int y, uint mouseData)
+        private void RecordMouseEvent(int message, int x, int y, uint mouseData, bool isCtrlPressed)
         {
             var targetInfo = ResolveElementAtPoint(x, y);
             var action = message switch
@@ -314,12 +316,24 @@ namespace FlaUI_Test_Recorder
 
             var elementVariableName = $"element{_recordedInteractions.Count + 1}";
             var locator = targetInfo is null ? null : BuildFlaUiLocator(targetInfo);
-            var textAssertionCode = BuildTextAssertionCode(targetInfo, elementVariableName);
+            var assertionVariableName = $"actualText{_recordedInteractions.Count + 1}";
+
+            if (isCtrlPressed && action == "LeftClick")
+            {
+                var assertionCode = BuildCtrlLeftClickAssertionCode(targetInfo, locator, elementVariableName, assertionVariableName);
+                var assertionDescription = targetInfo is null
+                    ? "Ctrl+LeftClick assert text (no target element metadata found)"
+                    : $"Ctrl+LeftClick assert text equals '{targetInfo.TextContent ?? targetInfo.Name ?? string.Empty}' on {elementSummary}";
+
+                AddRecorderEvent(RecorderEventType.Mouse, assertionDescription, assertionCode);
+                RefreshGeneratedCode();
+                return;
+            }
 
             var codeLine = action switch
             {
-                "LeftClick" when locator is not null => $"var {elementVariableName} = Retry.WhileNull(() => {locator}, TimeSpan.FromSeconds({ElementWaitTimeoutSeconds}), TimeSpan.FromMilliseconds({WaitPollMilliseconds})).Result; if ({elementVariableName} != null) Mouse.Click({elementVariableName}.GetClickablePoint()); Wait.UntilInputIsProcessed(); {textAssertionCode}",
-                "RightClick" when locator is not null => $"var {elementVariableName} = Retry.WhileNull(() => {locator}, TimeSpan.FromSeconds({ElementWaitTimeoutSeconds}), TimeSpan.FromMilliseconds({WaitPollMilliseconds})).Result; if ({elementVariableName} != null) Mouse.Click({elementVariableName}.GetClickablePoint(), MouseButton.Right); Wait.UntilInputIsProcessed(); {textAssertionCode}",
+                "LeftClick" when locator is not null => $"var {elementVariableName} = Retry.WhileNull(() => {locator}, TimeSpan.FromSeconds({ElementWaitTimeoutSeconds}), TimeSpan.FromMilliseconds({WaitPollMilliseconds})).Result; if ({elementVariableName} != null) Mouse.Click({elementVariableName}.GetClickablePoint()); Wait.UntilInputIsProcessed();",
+                "RightClick" when locator is not null => $"var {elementVariableName} = Retry.WhileNull(() => {locator}, TimeSpan.FromSeconds({ElementWaitTimeoutSeconds}), TimeSpan.FromMilliseconds({WaitPollMilliseconds})).Result; if ({elementVariableName} != null) Mouse.Click({elementVariableName}.GetClickablePoint(), MouseButton.Right); Wait.UntilInputIsProcessed();",
                 "MiddleClick" when locator is not null => $"var {elementVariableName} = Retry.WhileNull(() => {locator}, TimeSpan.FromSeconds({ElementWaitTimeoutSeconds}), TimeSpan.FromMilliseconds({WaitPollMilliseconds})).Result; // Middle click on {elementVariableName} - customize if needed; Wait.UntilInputIsProcessed();",
                 "WheelUp" when locator is not null => $"var {elementVariableName} = Retry.WhileNull(() => {locator}, TimeSpan.FromSeconds({ElementWaitTimeoutSeconds}), TimeSpan.FromMilliseconds({WaitPollMilliseconds})).Result; // Wheel up on {elementVariableName}; Wait.UntilInputIsProcessed();",
                 "WheelDown" when locator is not null => $"var {elementVariableName} = Retry.WhileNull(() => {locator}, TimeSpan.FromSeconds({ElementWaitTimeoutSeconds}), TimeSpan.FromMilliseconds({WaitPollMilliseconds})).Result; // Wheel down on {elementVariableName}; Wait.UntilInputIsProcessed();",
@@ -330,6 +344,27 @@ namespace FlaUI_Test_Recorder
 
             AddRecorderEvent(RecorderEventType.Mouse, $"{action} on {elementSummary}", codeLine);
             RefreshGeneratedCode();
+        }
+
+        private static string BuildCtrlLeftClickAssertionCode(TargetElementInfo? targetInfo, string? locator, string elementVariableName, string assertionVariableName)
+        {
+            if (targetInfo is null || string.IsNullOrWhiteSpace(locator))
+            {
+                return "// Ctrl+LeftClick assertion requested but no UIA Name/AutomationId was found for the target element";
+            }
+
+            var expectedText = targetInfo.TextContent ?? targetInfo.Name;
+            if (string.IsNullOrWhiteSpace(expectedText))
+            {
+                return "// Ctrl+LeftClick assertion requested but the target element has no readable text content";
+            }
+
+            return $"var {elementVariableName} = Retry.WhileNull(() => {locator}, TimeSpan.FromSeconds({ElementWaitTimeoutSeconds}), TimeSpan.FromMilliseconds({WaitPollMilliseconds})).Result; if ({elementVariableName} == null) throw new Exception(\"Assertion target not found.\"); var {assertionVariableName} = {elementVariableName}.Patterns.Value.PatternOrDefault?.Value ?? {elementVariableName}.Name ?? string.Empty; if (!string.Equals({assertionVariableName}, \"{EscapeForCode(expectedText)}\", StringComparison.Ordinal)) throw new Exception($\"Text assertion failed. Expected '{EscapeForCode(expectedText)}' but was '{{{assertionVariableName}}}'.\");";
+        }
+
+        private static bool IsControlPressed()
+        {
+            return (GetKeyState(VkControl) & 0x8000) != 0;
         }
 
         private static TargetElementInfo? ResolveElementAtPoint(int x, int y)
@@ -376,17 +411,6 @@ namespace FlaUI_Test_Recorder
             }
         }
 
-        private static string BuildTextAssertionCode(TargetElementInfo? target, string elementVariableName)
-        {
-            if (target is null || string.IsNullOrWhiteSpace(target.TextContent))
-            {
-                return string.Empty;
-            }
-
-            var expectedText = EscapeForCode(target.TextContent);
-            return $"if ({elementVariableName} != null && !string.Equals({elementVariableName}.Name, \"{expectedText}\", StringComparison.Ordinal)) throw new Exception(\"Text assertion failed for {elementVariableName}.\");";
-        }
-
         private static string BuildFlaUiLocator(TargetElementInfo target)
         {
             if (!string.IsNullOrWhiteSpace(target.AutomationId) && !string.IsNullOrWhiteSpace(target.Name))
@@ -404,7 +428,7 @@ namespace FlaUI_Test_Recorder
 
         private void RecordKeyboardEvent(Key key)
         {
-            if (key == Key.None)
+            if (key == Key.None || key == Key.LeftCtrl)
             {
                 return;
             }
@@ -599,5 +623,8 @@ namespace FlaUI_Test_Recorder
 
         [DllImport("user32.dll")]
         private static extern uint GetWindowThreadProcessId(IntPtr windowHandle, out uint processId);
+
+        [DllImport("user32.dll")]
+        private static extern short GetKeyState(int virtualKeyCode);
     }
 }
