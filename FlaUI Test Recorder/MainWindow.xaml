@@ -128,7 +128,7 @@
                         Padding="14,8"
                         VerticalAlignment="Center">
                     <TextBlock x:Name="StatusTextBlock"
-                               Text="Idle"
+                               Text="{Binding StatusText}"
                                Foreground="#BFD2FF"
                                FontWeight="SemiBold" />
                 </Border>
@@ -157,16 +157,17 @@
                             Orientation="Horizontal"
                             VerticalAlignment="Center">
                     <TextBox x:Name="TargetPathTextBox"
+                             Text="{Binding TargetPath, UpdateSourceTrigger=PropertyChanged}"
                              MinWidth="620"
                              VerticalContentAlignment="Center" />
                     <Button x:Name="BrowseButton"
                             Content="Browse"
                             Margin="10,0,0,0"
-                            Click="BrowseButton_Click" />
+                            Command="{Binding BrowseCommand}" />
                     <Button x:Name="LaunchButton"
                             Content="Launch Target"
                             Margin="10,0,0,0"
-                            Click="LaunchButton_Click"
+                            Command="{Binding LaunchCommand}"
                             Style="{StaticResource AccentButtonStyle}" />
                 </StackPanel>
 
@@ -179,18 +180,18 @@
                             Content="Start Recording"
                             Width="140"
                             Margin="0,0,10,0"
-                            Click="StartRecordingButton_Click"
+                            Command="{Binding StartRecordingCommand}"
                             Style="{StaticResource AccentButtonStyle}" />
                     <Button x:Name="StopRecordingButton"
                             Content="Stop"
                             Width="90"
                             Margin="0,0,10,0"
-                            Click="StopRecordingButton_Click"
+                            Command="{Binding StopRecordingCommand}"
                             Style="{StaticResource DangerButtonStyle}" />
                     <Button x:Name="ClearButton"
                             Content="Clear"
                             Width="90"
-                            Click="ClearButton_Click" />
+                            Command="{Binding ClearCommand}" />
                 </StackPanel>
             </Grid>
         </Border>
@@ -214,6 +215,7 @@
                                FontWeight="SemiBold" />
 
                     <ListView x:Name="EventsListView"
+                              ItemsSource="{Binding RecordedInteractions}"
                               Grid.Row="1"
                               Margin="0,12,0,0"
                               Background="#20293A"
@@ -244,6 +246,7 @@
                                FontWeight="SemiBold" />
 
                     <TextBox x:Name="GeneratedCodeTextBox"
+                             Text="{Binding GeneratedCode, Mode=OneWay}"
                              Grid.Row="1"
                              Margin="0,12,0,0"
                              AcceptsReturn="True"
@@ -265,12 +268,12 @@
                                 Content="Regenerate"
                                 Width="110"
                                 Margin="0,0,10,0"
-                                Click="RegenerateButton_Click" />
+                                Command="{Binding RegenerateCommand}" />
                         <Button x:Name="CopyCodeButton"
                                 Content="Copy Code"
                                 Width="110"
                                 Style="{StaticResource AccentButtonStyle}"
-                                Click="CopyCodeButton_Click" />
+                                Command="{Binding CopyCodeCommand}" />
                     </StackPanel>
                 </Grid>
             </Border>
