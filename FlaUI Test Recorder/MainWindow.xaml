@@ -146,6 +146,7 @@
                 <Grid.RowDefinitions>
                     <RowDefinition Height="Auto" />
                     <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
                 </Grid.RowDefinitions>
 
                 <TextBlock Grid.Row="0"
@@ -171,8 +172,30 @@
                             Style="{StaticResource AccentButtonStyle}" />
                 </StackPanel>
 
+                <StackPanel Grid.Row="2"
+                            Orientation="Horizontal"
+                            VerticalAlignment="Center"
+                            Margin="0,10,0,0">
+                    <TextBlock Text="or attach by PID"
+                               VerticalAlignment="Center"
+                               Foreground="{StaticResource MutedTextBrush}"
+                               Margin="0,0,10,0" />
+                    <TextBox x:Name="TargetProcessIdTextBox"
+                             Text="{Binding TargetProcessIdInput, UpdateSourceTrigger=PropertyChanged}"
+                             Width="150"
+                             VerticalContentAlignment="Center" />
+                    <Button x:Name="ChooseProcessButton"
+                            Content="Choose"
+                            Margin="10,0,0,0"
+                            Command="{Binding SelectRunningProcessCommand}" />
+                    <Button x:Name="AttachButton"
+                            Content="Attach"
+                            Margin="10,0,0,0"
+                            Command="{Binding AttachCommand}" />
+                </StackPanel>
+
                 <StackPanel Grid.Column="1"
-                            Grid.RowSpan="2"
+                            Grid.RowSpan="3"
                             Orientation="Horizontal"
                             HorizontalAlignment="Right"
                             VerticalAlignment="Bottom">

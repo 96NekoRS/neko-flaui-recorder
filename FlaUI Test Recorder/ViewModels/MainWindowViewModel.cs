@@ -1,10 +1,13 @@
 using FlaUI_Test_Recorder.Commands;
 using Microsoft.Win32;
+using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 using System.Windows;
 using System.Windows.Automation;
 using System.Windows.Input;
@@ -25,21 +28,29 @@ public sealed class MainWindowViewModel : ViewModelBase
     private const int VkControl = 0x11;
     private const int ElementWaitTimeoutSeconds = 10;
     private const int WaitPollMilliseconds = 200;
+    private const int ProcessSwitchTimeoutSeconds = 8;
+    private const int ProcessSwitchPollMilliseconds = 200;
+    private const uint Th32CsSnapProcess = 0x00000002;
 
     private readonly Dispatcher _dispatcher;
     private readonly RelayCommand _launchCommand;
+    private readonly RelayCommand _attachCommand;
+    private readonly RelayCommand _selectRunningProcessCommand;
     private readonly RelayCommand _startRecordingCommand;
     private readonly RelayCommand _stopRecordingCommand;
     private readonly RelayCommand _copyCodeCommand;
 
     private Process? _targetProcess;
     private string? _targetExecutablePath;
+    private int? _attachedProcessId;
+    private bool _useAttachInGeneratedCode;
     private bool _isRecording;
     private IntPtr _mouseHookHandle;
     private IntPtr _keyboardHookHandle;
     private LowLevelMouseProc? _mouseProc;
     private LowLevelKeyboardProc? _keyboardProc;
     private string _targetPath = string.Empty;
+    private string _targetProcessIdInput = string.Empty;
     private string _statusText = "Idle";
     private string _generatedCode = string.Empty;
 
@@ -50,6 +61,8 @@ public sealed class MainWindowViewModel : ViewModelBase
 
         BrowseCommand = new RelayCommand(Browse);
         _launchCommand = new RelayCommand(LaunchTarget, CanLaunchTarget);
+        _attachCommand = new RelayCommand(AttachToRunningProcess, CanAttachToRunningProcess);
+        _selectRunningProcessCommand = new RelayCommand(SelectRunningProcess, CanSelectRunningProcess);
         _startRecordingCommand = new RelayCommand(StartRecording, CanStartRecording);
         _stopRecordingCommand = new RelayCommand(StopRecording, () => IsRecording);
         ClearCommand = new RelayCommand(Clear);
@@ -57,11 +70,26 @@ public sealed class MainWindowViewModel : ViewModelBase
         _copyCodeCommand = new RelayCommand(CopyCode, () => !string.IsNullOrWhiteSpace(GeneratedCode));
 
         LaunchCommand = _launchCommand;
+        AttachCommand = _attachCommand;
+        SelectRunningProcessCommand = _selectRunningProcessCommand;
         StartRecordingCommand = _startRecordingCommand;
         StopRecordingCommand = _stopRecordingCommand;
         CopyCodeCommand = _copyCodeCommand;
 
         RefreshGeneratedCode();
+    }
+
+    public string TargetProcessIdInput
+    {
+        get => _targetProcessIdInput;
+        set
+        {
+            if (SetProperty(ref _targetProcessIdInput, value))
+            {
+                RaiseCommandStates();
+                RefreshGeneratedCode();
+            }
+        }
     }
 
     public ObservableCollection<RecordedInteraction> RecordedInteractions { get; }
@@ -111,6 +139,8 @@ public sealed class MainWindowViewModel : ViewModelBase
 
     public ICommand BrowseCommand { get; }
     public ICommand LaunchCommand { get; }
+    public ICommand AttachCommand { get; }
+    public ICommand SelectRunningProcessCommand { get; }
     public ICommand StartRecordingCommand { get; }
     public ICommand StopRecordingCommand { get; }
     public ICommand ClearCommand { get; }
@@ -179,11 +209,69 @@ public sealed class MainWindowViewModel : ViewModelBase
                 return;
             }
 
-            AttachToTargetProcess(process, targetPath);
+            AttachToTargetProcess(process, targetPath, false);
         }
         catch (Exception ex)
         {
             MessageBox.Show($"Failed to launch target process.\n{ex.Message}", "Launch Failed", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+    }
+
+    private bool CanAttachToRunningProcess()
+    {
+        if (IsRecording)
+        {
+            return false;
+        }
+
+        return int.TryParse(TargetProcessIdInput.Trim(), out var processId) && processId > 0;
+    }
+
+    private bool CanSelectRunningProcess()
+    {
+        return !IsRecording;
+    }
+
+    private void SelectRunningProcess()
+    {
+        var processPicker = new ProcessPickerWindow
+        {
+            Owner = Application.Current.MainWindow
+        };
+
+        if (processPicker.ShowDialog() != true || processPicker.SelectedProcessId is null)
+        {
+            return;
+        }
+
+        TargetProcessIdInput = processPicker.SelectedProcessId.Value.ToString();
+        UpdateStatus($"Selected PID {TargetProcessIdInput}");
+    }
+
+    private void AttachToRunningProcess()
+    {
+        if (!int.TryParse(TargetProcessIdInput.Trim(), out var processId) || processId <= 0)
+        {
+            MessageBox.Show("Enter a valid process id (PID).", "Invalid PID", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
+        try
+        {
+            var process = Process.GetProcessById(processId);
+            if (process.HasExited)
+            {
+                MessageBox.Show("The selected process has already exited.", "Attach Failed", MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
+
+            var executablePath = TryGetProcessExecutablePath(process);
+            AttachToTargetProcess(process, executablePath, true);
+            UpdateStatus($"Attached to PID {process.Id}");
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"Failed to attach to process {processId}.\n{ex.Message}", "Attach Failed", MessageBoxButton.OK, MessageBoxImage.Error);
         }
     }
 
@@ -278,7 +366,7 @@ public sealed class MainWindowViewModel : ViewModelBase
         return true;
     }
 
-    private void AttachToTargetProcess(Process process, string executablePath)
+    private void AttachToTargetProcess(Process process, string? executablePath, bool useAttachInGeneratedCode, bool updateGeneratedEntryPoint = true)
     {
         if (_targetProcess is not null)
         {
@@ -288,17 +376,56 @@ public sealed class MainWindowViewModel : ViewModelBase
         _targetProcess = process;
         _targetProcess.EnableRaisingEvents = true;
         _targetProcess.Exited += TargetProcess_Exited;
-        _targetExecutablePath = executablePath;
-        TargetPath = executablePath;
-        AddRecorderEvent(RecorderEventType.Process, $"Target started: {Path.GetFileName(executablePath)} (PID {_targetProcess.Id})");
-        UpdateStatus("Target launched");
+        if (updateGeneratedEntryPoint)
+        {
+            _targetExecutablePath = executablePath;
+            _attachedProcessId = _targetProcess.Id;
+            _useAttachInGeneratedCode = useAttachInGeneratedCode;
+        }
+
+        if (!string.IsNullOrWhiteSpace(executablePath))
+        {
+            TargetPath = executablePath;
+        }
+
+        TargetProcessIdInput = _targetProcess.Id.ToString();
+
+        var processLabel = !string.IsNullOrWhiteSpace(executablePath)
+            ? Path.GetFileName(executablePath)
+            : _targetProcess.ProcessName;
+        AddRecorderEvent(RecorderEventType.Process, $"Target attached: {processLabel} (PID {_targetProcess.Id})");
+        if (!useAttachInGeneratedCode)
+        {
+            UpdateStatus("Target launched");
+        }
+
         RefreshGeneratedCode();
     }
 
     private void TargetProcess_Exited(object? sender, EventArgs e)
     {
+        var exitedProcess = sender as Process;
+        var replacementProcess = exitedProcess is null ? null : WaitForReplacementProcess(exitedProcess.Id);
+
         _dispatcher.Invoke(() =>
         {
+            if (replacementProcess is not null && !replacementProcess.HasExited)
+            {
+                var replacementPath = TryGetProcessExecutablePath(replacementProcess);
+                AttachToTargetProcess(replacementProcess, replacementPath, useAttachInGeneratedCode: true, updateGeneratedEntryPoint: false);
+
+                var replacementLabel = !string.IsNullOrWhiteSpace(replacementPath)
+                    ? Path.GetFileName(replacementPath)
+                    : replacementProcess.ProcessName;
+                var switchCodeLine = BuildProcessHandoffCodeLine(replacementPath, replacementProcess.ProcessName);
+                AddRecorderEvent(RecorderEventType.Process, $"Process switched to {replacementLabel} (PID {replacementProcess.Id})", switchCodeLine);
+
+                UpdateStatus(IsRecording ? "Recording (process switched)" : "Process switched");
+                RefreshGeneratedCode();
+                return;
+            }
+
+            _targetProcess = null;
             if (IsRecording)
             {
                 IsRecording = false;
@@ -310,6 +437,100 @@ public sealed class MainWindowViewModel : ViewModelBase
             UpdateStatus("Target exited");
             RefreshGeneratedCode();
         });
+    }
+
+    private static string BuildProcessHandoffCodeLine(string? executablePath, string processName)
+    {
+        if (!string.IsNullOrWhiteSpace(executablePath))
+        {
+            return $"var nextProcess = Retry.WhileNull(() => FindProcessByPath(\"{EscapeForCode(executablePath)}\"), TimeSpan.FromSeconds({ProcessSwitchTimeoutSeconds}), TimeSpan.FromMilliseconds({ProcessSwitchPollMilliseconds})).Result; Assert.IsNotNull(nextProcess, \"Successor process not found.\"); app.Dispose(); app = Application.Attach(nextProcess!.Id); window = Retry.WhileNull(() => app.GetMainWindow(automation), TimeSpan.FromSeconds({ElementWaitTimeoutSeconds}), TimeSpan.FromMilliseconds({WaitPollMilliseconds})).Result ?? throw new InvalidOperationException(\"Main window not found.\"); window.Focus();";
+        }
+
+        return $"var nextProcess = Retry.WhileNull(() => FindNewestProcessByName(\"{EscapeForCode(processName)}\"), TimeSpan.FromSeconds({ProcessSwitchTimeoutSeconds}), TimeSpan.FromMilliseconds({ProcessSwitchPollMilliseconds})).Result; Assert.IsNotNull(nextProcess, \"Successor process not found.\"); app.Dispose(); app = Application.Attach(nextProcess!.Id); window = Retry.WhileNull(() => app.GetMainWindow(automation), TimeSpan.FromSeconds({ElementWaitTimeoutSeconds}), TimeSpan.FromMilliseconds({WaitPollMilliseconds})).Result ?? throw new InvalidOperationException(\"Main window not found.\"); window.Focus();";
+    }
+
+    private static Process? WaitForReplacementProcess(int exitedProcessId)
+    {
+        var timeout = TimeSpan.FromSeconds(ProcessSwitchTimeoutSeconds);
+        var startedAt = Stopwatch.StartNew();
+
+        while (startedAt.Elapsed < timeout)
+        {
+            var replacement = FindNewestChildProcess(exitedProcessId);
+            if (replacement is not null)
+            {
+                return replacement;
+            }
+
+            Thread.Sleep(ProcessSwitchPollMilliseconds);
+        }
+
+        return null;
+    }
+
+    private static Process? FindNewestChildProcess(int parentProcessId)
+    {
+        var snapshot = CreateToolhelp32Snapshot(Th32CsSnapProcess, 0);
+        if (snapshot == IntPtr.Zero || snapshot == new IntPtr(-1))
+        {
+            return null;
+        }
+
+        try
+        {
+            var processEntry = new ProcessEntry32
+            {
+                DwSize = (uint)Marshal.SizeOf<ProcessEntry32>()
+            };
+
+            var childCandidates = new List<Process>();
+            if (!Process32First(snapshot, ref processEntry))
+            {
+                return null;
+            }
+
+            do
+            {
+                if (processEntry.Th32ParentProcessId != (uint)parentProcessId)
+                {
+                    continue;
+                }
+
+                try
+                {
+                    var process = Process.GetProcessById((int)processEntry.Th32ProcessId);
+                    if (!process.HasExited)
+                    {
+                        childCandidates.Add(process);
+                    }
+                }
+                catch
+                {
+                    // ignore stale process ids
+                }
+            }
+            while (Process32Next(snapshot, ref processEntry));
+
+            return childCandidates
+                .OrderByDescending(GetProcessStartTimeSafe)
+                .FirstOrDefault();
+        }
+        finally
+        {
+            _ = CloseHandle(snapshot);
+        }
+    }
+
+    private static DateTime GetProcessStartTimeSafe(Process process)
+    {
+        try
+        {
+            return process.StartTime;
+        }
+        catch
+        {
+            return DateTime.MinValue;
+        }
     }
 
     private bool InstallHooks()
@@ -459,7 +680,7 @@ public sealed class MainWindowViewModel : ViewModelBase
             return "// Ctrl+LeftClick assertion requested but the target element has no readable text content";
         }
 
-        return $"var {elementVariableName} = Retry.WhileNull(() => {locator}, TimeSpan.FromSeconds({ElementWaitTimeoutSeconds}), TimeSpan.FromMilliseconds({WaitPollMilliseconds})).Result; if ({elementVariableName} == null) throw new Exception(\"Assertion target not found.\"); var {assertionVariableName} = {elementVariableName}.Patterns.Value.PatternOrDefault?.Value ?? {elementVariableName}.Name ?? string.Empty; if (!string.Equals({assertionVariableName}, \"{EscapeForCode(expectedText)}\", StringComparison.Ordinal)) throw new Exception($\"Text assertion failed. Expected '{EscapeForCode(expectedText)}' but was '{{{assertionVariableName}}}'.\");";
+        return $"var {elementVariableName} = Retry.WhileNull(() => {locator}, TimeSpan.FromSeconds({ElementWaitTimeoutSeconds}), TimeSpan.FromMilliseconds({WaitPollMilliseconds})).Result; Assert.IsNotNull({elementVariableName}, \"Assertion target not found.\"); var {assertionVariableName} = {elementVariableName}!.Patterns.Value.PatternOrDefault?.Value ?? {elementVariableName}.Name ?? string.Empty; Assert.AreEqual(\"{EscapeForCode(expectedText)}\", {assertionVariableName}, \"Text assertion failed.\");";
     }
 
     private static bool IsControlPressed()
@@ -592,24 +813,31 @@ public sealed class MainWindowViewModel : ViewModelBase
         builder.AppendLine("using FlaUI.Core.Input;");
         builder.AppendLine("using FlaUI.Core.Tools;");
         builder.AppendLine("using FlaUI.Core.WindowsAPI;");
+        builder.AppendLine("using Microsoft.VisualStudio.TestTools.UnitTesting;");
         builder.AppendLine("using System;");
+        builder.AppendLine("using System.Diagnostics;");
+        builder.AppendLine("using System.Linq;");
         builder.AppendLine("using FlaUI.UIA3;");
         builder.AppendLine();
         builder.AppendLine("public static class RecordedTest");
         builder.AppendLine("{");
         builder.AppendLine("    public static void Run()");
         builder.AppendLine("    {");
-        if (!string.IsNullOrWhiteSpace(_targetExecutablePath))
+        if (!_useAttachInGeneratedCode && !string.IsNullOrWhiteSpace(_targetExecutablePath))
         {
-            builder.AppendLine($"        using var app = Application.Launch(@\"{_targetExecutablePath.Replace("\\", "\\\\")}\");");
+            builder.AppendLine($"        var app = Application.Launch(@\"{_targetExecutablePath.Replace("\\", "\\\\")}\");");
+        }
+        else if (_attachedProcessId is int attachedProcessId && attachedProcessId > 0)
+        {
+            builder.AppendLine($"        var app = Application.Attach({attachedProcessId});");
         }
         else
         {
-            builder.AppendLine("        using var app = Application.Attach(12345); // Replace with the target process id");
+            builder.AppendLine("        var app = Application.Attach(12345); // Replace with the target process id");
         }
 
         builder.AppendLine("        using var automation = new UIA3Automation();");
-        builder.AppendLine("        var window = app.GetMainWindow(automation);\n");
+        builder.AppendLine($"        var window = Retry.WhileNull(() => app.GetMainWindow(automation), TimeSpan.FromSeconds({ElementWaitTimeoutSeconds}), TimeSpan.FromMilliseconds({WaitPollMilliseconds})).Result ?? throw new InvalidOperationException(\"Main window not found.\");\n");
         builder.AppendLine("        window.Focus();\n");
 
         if (RecordedInteractions.Count == 0)
@@ -625,6 +853,40 @@ public sealed class MainWindowViewModel : ViewModelBase
             }
         }
 
+        builder.AppendLine();
+        builder.AppendLine("        app.Dispose();");
+        builder.AppendLine("    }");
+        builder.AppendLine();
+        builder.AppendLine("    private static Process? FindProcessByPath(string executablePath)");
+        builder.AppendLine("    {");
+        builder.AppendLine("        return Process.GetProcesses().FirstOrDefault(process =>");
+        builder.AppendLine("        {");
+        builder.AppendLine("            try");
+        builder.AppendLine("            {");
+        builder.AppendLine("                return !process.HasExited && string.Equals(process.MainModule?.FileName, executablePath, StringComparison.OrdinalIgnoreCase);");
+        builder.AppendLine("            }");
+        builder.AppendLine("            catch");
+        builder.AppendLine("            {");
+        builder.AppendLine("                return false;");
+        builder.AppendLine("            }");
+        builder.AppendLine("        });");
+        builder.AppendLine("    }");
+        builder.AppendLine();
+        builder.AppendLine("    private static Process? FindNewestProcessByName(string processName)");
+        builder.AppendLine("    {");
+        builder.AppendLine("        return Process.GetProcessesByName(processName)");
+        builder.AppendLine("            .OrderByDescending(process =>");
+        builder.AppendLine("            {");
+        builder.AppendLine("                try");
+        builder.AppendLine("                {");
+        builder.AppendLine("                    return process.StartTime;");
+        builder.AppendLine("                }");
+        builder.AppendLine("                catch");
+        builder.AppendLine("                {");
+        builder.AppendLine("                    return DateTime.MinValue;");
+        builder.AppendLine("                }");
+        builder.AppendLine("            })");
+        builder.AppendLine("            .FirstOrDefault();");
         builder.AppendLine("    }");
         builder.AppendLine("}");
 
@@ -645,8 +907,22 @@ public sealed class MainWindowViewModel : ViewModelBase
     private void RaiseCommandStates()
     {
         _launchCommand.RaiseCanExecuteChanged();
+        _attachCommand.RaiseCanExecuteChanged();
+        _selectRunningProcessCommand.RaiseCanExecuteChanged();
         _startRecordingCommand.RaiseCanExecuteChanged();
         _stopRecordingCommand.RaiseCanExecuteChanged();
+    }
+
+    private static string? TryGetProcessExecutablePath(Process process)
+    {
+        try
+        {
+            return process.MainModule?.FileName;
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     public sealed class RecordedInteraction
@@ -694,6 +970,23 @@ public sealed class MainWindowViewModel : ViewModelBase
         public UIntPtr DwExtraInfo;
     }
 
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
+    private struct ProcessEntry32
+    {
+        public uint DwSize;
+        public uint CntUsage;
+        public uint Th32ProcessId;
+        public UIntPtr Th32DefaultHeapId;
+        public uint Th32ModuleId;
+        public uint CntThreads;
+        public uint Th32ParentProcessId;
+        public int PcPriClassBase;
+        public uint DwFlags;
+
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+        public string SzExeFile;
+    }
+
     [StructLayout(LayoutKind.Sequential)]
     private struct KbdLlHookStruct
     {
@@ -722,4 +1015,19 @@ public sealed class MainWindowViewModel : ViewModelBase
 
     [DllImport("user32.dll")]
     private static extern short GetKeyState(int virtualKeyCode);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr CreateToolhelp32Snapshot(uint flags, uint processId);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool Process32First(IntPtr snapshot, ref ProcessEntry32 processEntry);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool Process32Next(IntPtr snapshot, ref ProcessEntry32 processEntry);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CloseHandle(IntPtr handle);
 }
